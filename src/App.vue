@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import {
   NAlert,
   NButton,
@@ -17,22 +17,28 @@ import {
   NTag
 } from 'naive-ui'
 import { useStudio } from './useStudio'
-import type { Cue, CueKind, Rate } from './types'
+import { formatClock, SFX_TRACKS, TRACK_LABELS } from './scheduler'
+import type { Cue, CueKind, CuePlacement, Rate, TrackId, WarningItem } from './types'
 
 const studio = useStudio()
 const {
   state,
   selectedSceneId,
+  selectedCueId,
   selectedScene,
+  timetable,
   totalDuration,
   pendingChanges,
   warnings,
   saveState,
   durationOfCue,
   durationOfScene,
+  cuePlacement,
+  sceneSchedule,
   updateProject,
   updateScene,
   updateCue,
+  toggleCueLock,
   addScene,
   deleteScene,
   addCue,
@@ -95,6 +101,93 @@ function cueName(cue: Cue) {
   if (cue.kind === 'dialogue') return state.value.document.characters.find((item) => item.id === cue.characterId)?.name ?? '未指定角色'
   if (cue.kind === 'sfx') return state.value.document.soundEffects.find((item) => item.id === cue.soundEffectId)?.name ?? '缺失音效'
   return '转场'
+}
+
+// —— 时间表视图 ——
+const selectedSchedule = computed(() =>
+  selectedScene.value ? sceneSchedule(selectedScene.value) : undefined
+)
+const timelineSpan = computed(() => Math.max(1, selectedSchedule.value?.span ?? 1))
+const timelineTicks = computed(() => {
+  const span = timelineSpan.value
+  const candidates = [1, 2, 5, 10, 15, 30, 60]
+  const step = candidates.find((value) => span / value <= 12) ?? Math.ceil(span / 12 / 10) * 10
+  const ticks: number[] = []
+  for (let value = 0; value <= span + 0.001; value += step) ticks.push(Number(value.toFixed(1)))
+  return { step, ticks }
+})
+
+function lanePlacements(track: TrackId): CuePlacement[] {
+  const schedule = selectedSchedule.value
+  if (!schedule) return []
+  return schedule.placements
+    .filter((item) => item.track === track)
+    .map((item) => ({ ...item, start: item.start - schedule.start, end: item.end - schedule.start }))
+}
+
+const rejectedPlacements = computed(() => {
+  const schedule = selectedSchedule.value
+  if (!schedule) return []
+  return schedule.rejected.map((item) => ({
+    ...item,
+    start: item.start - schedule.start,
+    end: item.end - schedule.start
+  }))
+})
+const sceneConflicts = computed(() => selectedSchedule.value?.conflicts ?? [])
+const sceneStartClock = computed(() => formatClock(selectedSchedule.value?.start ?? 0))
+
+function blockStyle(placement: CuePlacement) {
+  const span = timelineSpan.value
+  return {
+    left: `${(placement.start / span) * 100}%`,
+    width: `${Math.max(1.6, (placement.duration / span) * 100)}%`
+  }
+}
+
+function blockTitle(cueId: string) {
+  const cue = state.value.document.scenes.flatMap((scene) => scene.cues).find((item) => item.id === cueId)
+  return cue ? cueName(cue) : ''
+}
+
+function blockText(cueId: string) {
+  const cue = state.value.document.scenes.flatMap((scene) => scene.cues).find((item) => item.id === cueId)
+  return cue?.text ?? ''
+}
+
+function relativeStart(cueId: string) {
+  const placement = cuePlacement(cueId)
+  const schedule = selectedSchedule.value
+  if (!placement || !schedule) return undefined
+  return Math.round((placement.start - schedule.start) * 10) / 10
+}
+
+function cueConflict(cueId: string) {
+  return sceneConflicts.value.find((conflict) => conflict.cueId === cueId)
+}
+
+function isRejected(cueId: string) {
+  return rejectedPlacements.value.some((item) => item.cueId === cueId)
+}
+
+function warningTagLabel(type: WarningItem['type']) {
+  switch (type) {
+    case 'collision': return '撞场'
+    case 'missing-sfx': return '引用'
+    case 'over-time': return '时长'
+    case 'actor-overlap': return '演员'
+    case 'track-overlap': return '轨位'
+    case 'channel-full': return '通道'
+    case 'invalid-locked-start': return '锁定'
+    default: return '冲突'
+  }
+}
+
+function selectCue(cueId: string) {
+  selectedCueId.value = cueId
+  nextTick(() => {
+    document.querySelector(`[data-cue-id="${cueId}"]`)?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+  })
 }
 
 function sceneStatus(sceneId: string) {
@@ -275,6 +368,77 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
           <div class="timeline-heading">
             <div>
               <span class="eyebrow">TIMELINE</span>
+              <h3>多轨时间表</h3>
+            </div>
+            <div class="timeline-summary">
+              <span>入场 {{ sceneStartClock }}</span>
+              <span>跨度 {{ (selectedSchedule?.span ?? 0).toFixed(1) }}s</span>
+              <span :class="{ danger: sceneConflicts.length }">冲突 {{ sceneConflicts.length }}</span>
+              <span :class="{ danger: rejectedPlacements.length }">拒绝 {{ rejectedPlacements.length }}</span>
+            </div>
+          </div>
+
+          <div v-if="selectedSchedule" class="timetable-panel">
+            <div class="timeline-ruler">
+              <span class="ruler-label">本场秒（全局）</span>
+              <div class="ruler-track">
+                <span
+                  v-for="tick in timelineTicks.ticks"
+                  :key="tick"
+                  class="ruler-tick"
+                  :style="{ left: `${(tick / timelineSpan) * 100}%` }"
+                >{{ tick.toFixed(0) }}<small>{{ formatClock((selectedSchedule.start ?? 0) + tick) }}</small></span>
+              </div>
+            </div>
+
+            <div v-for="track in ['main', ...SFX_TRACKS] as TrackId[]" :key="track" class="timeline-lane" :class="`lane-${track}`">
+              <div class="lane-name">
+                <strong>{{ TRACK_LABELS[track] }}</strong>
+              </div>
+              <div class="lane-track">
+                <button
+                  v-for="placement in lanePlacements(track)"
+                  :key="placement.cueId"
+                  class="lane-block"
+                  :class="[`block-${placement.kind}`, { locked: placement.locked, selected: selectedCueId === placement.cueId }]"
+                  :style="blockStyle(placement)"
+                  :title="`${blockTitle(placement.cueId)}｜全场 ${formatClock((selectedSchedule.start ?? 0) + placement.start)} → ${formatClock((selectedSchedule.start ?? 0) + placement.end)}（本场 ${placement.start.toFixed(1)}–${placement.end.toFixed(1)}s）`"
+                  @click="selectCue(placement.cueId)"
+                >
+                  <span class="block-label">{{ blockTitle(placement.cueId) }}<template v-if="placement.locked"> 🔒</template></span>
+                  <span class="block-time">{{ placement.start.toFixed(1) }}–{{ placement.end.toFixed(1) }}</span>
+                </button>
+              </div>
+            </div>
+
+            <div v-if="rejectedPlacements.length" class="rejected-strip">
+              <strong>被拒绝的提示（通道容量不足，按场次分批）：</strong>
+              <n-tag
+                v-for="placement in rejectedPlacements"
+                :key="placement.cueId"
+                size="small"
+                type="error"
+                class="rejected-tag"
+                @click="selectCue(placement.cueId)"
+              >
+                {{ blockText(placement.cueId) }} @{{ placement.start.toFixed(1) }}s
+              </n-tag>
+            </div>
+
+            <div v-if="sceneConflicts.length" class="conflict-strip">
+              <div v-for="conflict in sceneConflicts" :key="`${conflict.type}-${conflict.cueId}`" class="conflict-line">
+                <n-tag size="small" :type="conflict.level === 'error' ? 'error' : 'warning'" :bordered="false">
+                  {{ warningTagLabel(conflict.type) }}
+                </n-tag>
+                <span>{{ conflict.detail }}</span>
+                <n-button size="tiny" quaternary @click="selectCue(conflict.cueId)">定位提示</n-button>
+              </div>
+            </div>
+          </div>
+
+          <div class="timeline-heading cues-heading">
+            <div>
+              <span class="eyebrow">CUE LIST</span>
               <h3>台词与声音提示</h3>
             </div>
             <div class="add-actions">
@@ -288,13 +452,18 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
             <article
               v-for="(cue, index) in selectedScene.cues"
               :key="cue.id"
+              :data-cue-id="cue.id"
               class="cue-card"
-              :class="[`kind-${cue.kind}`, { dragging: dragCueId === cue.id }]"
+              :class="[
+                `kind-${cue.kind}`,
+                { dragging: dragCueId === cue.id, selected: selectedCueId === cue.id, rejected: isRejected(cue.id), conflicted: !!cueConflict(cue.id) }
+              ]"
               draggable="true"
               @dragstart="dragCueId = cue.id"
               @dragend="dragCueId = ''"
               @dragover.prevent
               @drop="dropCue(cue.id)"
+              @click="selectedCueId = cue.id"
             >
               <div class="cue-grip" title="拖动调整顺序">⋮⋮</div>
               <div class="cue-main">
@@ -302,8 +471,32 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
                   <span class="cue-number">{{ String(index + 1).padStart(2, '0') }}</span>
                   <n-select class="kind-select" size="small" :value="cue.kind" :options="kindOptions" @update:value="changeCueKind(cue, $event)" />
                   <n-tag size="small" :bordered="false">{{ cueName(cue) }}</n-tag>
+                  <span v-if="cuePlacement(cue.id)?.track" class="track-pill">{{ TRACK_LABELS[cuePlacement(cue.id)!.track!] }}</span>
+                  <n-tag v-if="isRejected(cue.id)" size="small" type="error" :bordered="false">已拒绝</n-tag>
+                  <span v-if="cueConflict(cue.id)" class="conflict-pill" :title="cueConflict(cue.id)?.detail">⚠ {{ warningTagLabel(cueConflict(cue.id)!.type) }}</span>
+                  <span class="time-pill" :title="`全场时间 ${cuePlacement(cue.id) ? formatClock(cuePlacement(cue.id)!.start) : '--'}`">
+                    {{ cuePlacement(cue.id) ? `${formatClock(cuePlacement(cue.id)!.start)}–${formatClock(cuePlacement(cue.id)!.end)}` : '未排入' }}
+                  </span>
                   <span class="duration-pill">{{ durationOfCue(cue).toFixed(1) }}s</span>
-                  <n-button size="tiny" tertiary type="error" @click="deleteCue(cue.id)">删除</n-button>
+                  <n-button
+                    size="tiny"
+                    :type="cue.lockedStart !== undefined ? 'warning' : 'default'"
+                    :secondary="cue.lockedStart !== undefined"
+                    @click.stop="toggleCueLock(cue.id)"
+                  >{{ cue.lockedStart !== undefined ? '🔒 已锁定' : '🔓 锁定起点' }}</n-button>
+                  <n-button size="tiny" tertiary type="error" @click.stop="deleteCue(cue.id)">删除</n-button>
+                </div>
+
+                <div v-if="cue.lockedStart !== undefined" class="lock-row">
+                  <span>锁定起点（本场相对秒）</span>
+                  <n-input-number
+                    :value="cue.lockedStart"
+                    size="small"
+                    :min="0"
+                    :step="0.5"
+                    @update:value="updateCue(cue.id, 'lockedStart', $event ?? undefined)"
+                  />
+                  <span class="lock-hint">锁定后拖动、改语速或换音效只重排其后的提示，本项不动；当前位置 {{ relativeStart(cue.id)?.toFixed(1) }}s</span>
                 </div>
 
                 <div v-if="cue.kind === 'dialogue'" class="cue-grid">
@@ -352,7 +545,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
               <div class="review-list">
                 <div v-for="warning in warnings" :key="warning.id" class="warning-card" :class="warning.level">
                   <div class="warning-title">
-                    <n-tag size="small" :type="warning.level === 'error' ? 'error' : 'warning'" :bordered="false">{{ warning.type === 'collision' ? '撞场' : warning.type === 'missing-sfx' ? '引用' : '时长' }}</n-tag>
+                    <n-tag size="small" :type="warning.level === 'error' ? 'error' : 'warning'" :bordered="false">{{ warningTagLabel(warning.type) }}</n-tag>
                     <strong>{{ warning.title }}</strong>
                   </div>
                   <p>{{ warning.detail }}</p>
@@ -388,7 +581,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
                   <div>
                     <strong>{{ version.name }}</strong>
                     <span>{{ new Date(version.createdAt).toLocaleString('zh-CN') }}</span>
-                    <small>{{ version.document.scenes.length }} 场 · {{ version.totalDuration.toFixed(1) }} 秒</small>
+                    <small>{{ version.document.scenes.length }} 场 · {{ version.totalDuration.toFixed(1) }} 秒 · {{ version.timetable?.conflicts.length ?? 0 }} 冲突</small>
                   </div>
                   <n-button size="small" type="primary" secondary @click="downloadVersion(version)">导出稿</n-button>
                 </div>

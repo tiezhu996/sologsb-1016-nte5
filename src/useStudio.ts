@@ -1,17 +1,51 @@
 import { computed, ref, watch } from 'vue'
 import { sampleDocument } from './sample'
-import type { Cue, CueKind, FrozenVersion, PendingChange, Scene, StudioDocument, StudioState, WarningItem } from './types'
+import { buildTimetable, cueDuration, formatClock, SFX_TRACKS, TRACK_LABELS } from './scheduler'
+import type {
+  Cue,
+  CueKind,
+  CuePlacement,
+  FrozenVersion,
+  PendingChange,
+  Scene,
+  StudioDocument,
+  StudioState,
+  Timetable,
+  WarningItem
+} from './types'
 
 const STORAGE_KEY = 'sologsb-1016-studio-v1'
 const clone = <T,>(value: T): T => JSON.parse(JSON.stringify(value)) as T
 const uid = (prefix: string) => `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`
+const round1 = (value: number) => Math.round(value * 10) / 10
+
+/**
+ * 旧稿兼容：历史数据没有锁定字段，也没有冻结时间表。
+ * 补齐 lockedStart 缺省（undefined 即顺序流式排布），冻结稿的时间表在读取时按需补齐。
+ */
+function migrateState(parsed: StudioState): StudioState {
+  for (const scene of parsed.document?.scenes ?? []) {
+    for (const cue of scene.cues ?? []) {
+      if (!('lockedStart' in cue)) cue.lockedStart = undefined
+    }
+  }
+  for (const version of parsed.frozen ?? []) {
+    for (const scene of version.document?.scenes ?? []) {
+      for (const cue of scene.cues ?? []) {
+        if (!('lockedStart' in cue)) cue.lockedStart = undefined
+      }
+    }
+    if (!version.timetable) version.timetable = buildTimetable(version.document)
+  }
+  return parsed
+}
 
 function loadState(): StudioState {
   try {
     const raw = localStorage.getItem(STORAGE_KEY)
     if (raw) {
       const parsed = JSON.parse(raw) as StudioState
-      if (parsed.document?.scenes?.length) return parsed
+      if (parsed.document?.scenes?.length) return migrateState(parsed)
     }
   } catch {
     // A corrupt local draft should not prevent access to the built-in example.
@@ -35,23 +69,33 @@ export function useStudio() {
 
   const selectedScene = computed(() => state.value.document.scenes.find((scene) => scene.id === selectedSceneId.value) ?? state.value.document.scenes[0])
 
+  // 全稿时间表：任意拖动 / 语速 / 音效修改都会整体重算，
+  // 但未锁定项只受其位置之后的变化影响（同位置前内容不变时起点不变）。
+  const timetable = computed<Timetable>(() => buildTimetable(state.value.document))
+
+  const sceneSchedule = (scene: Scene) =>
+    timetable.value.scenes.find((item) => item.sceneId === scene.id)
+
   function durationOfCue(cue: Cue): number {
-    if (cue.manualDuration !== undefined) return cue.manualDuration
-    if (cue.kind === 'sfx') {
-      return state.value.document.soundEffects.find((effect) => effect.id === cue.soundEffectId)?.duration ?? 6
-    }
-    if (cue.kind === 'transition') return 3
-    const pauses = (cue.text.match(/[，。！？；、…]/g)?.length ?? 0) * 0.22
-    const effectiveRate = cue.rate || 1
-    return Number((cue.text.length / (4.2 * effectiveRate) + pauses).toFixed(1))
+    return cueDuration(cue, state.value.document.soundEffects)
   }
 
+  /** 场次跨度 = 主轨末尾与最远音效末尾的较大者；被拒绝的音效不占时长。 */
   function durationOfScene(scene: Scene): number {
-    return Number(scene.cues.reduce((total, cue) => total + durationOfCue(cue), 0).toFixed(1))
+    return sceneSchedule(scene)?.span ?? 0
   }
 
-  const totalDuration = computed(() => state.value.document.scenes.reduce((total, scene) => total + durationOfScene(scene), 0))
+  const totalDuration = computed(() => timetable.value.totalDuration)
   const pendingChanges = computed(() => state.value.pending.filter((item) => item.status === 'pending'))
+
+  function cuePlacement(cueId: string): CuePlacement | undefined {
+    for (const schedule of timetable.value.scenes) {
+      const hit = schedule.placements.find((item) => item.cueId === cueId)
+        ?? schedule.rejected.find((item) => item.cueId === cueId)
+      if (hit) return hit
+    }
+    return undefined
+  }
 
   const warnings = computed<WarningItem[]>(() => {
     const result: WarningItem[] = []
@@ -74,7 +118,7 @@ export function useStudio() {
             sceneId: scene.id,
             cueId: cue.id,
             title: `${scene.code} 音效引用缺失`,
-            detail: `“${cue.text}”引用了不存在的音效 ${cue.soundEffectId}。`
+            detail: `“${cue.text}”引用了不存在的音效 ${cue.soundEffectId}，时间表按 6 秒占位。`
           })
         }
       }
@@ -91,6 +135,13 @@ export function useStudio() {
           })
         }
       })
+
+      // 时间表冲突：同演员重叠 / 主轨重叠 / 通道容量不足 / 非法锁定点。
+      const schedule = sceneSchedule(scene)
+      for (const conflict of schedule?.conflicts ?? []) {
+        result.push({ id: `schedule-${conflict.type}-${conflict.cueId}`, ...conflict })
+      }
+
       const sceneDuration = durationOfScene(scene)
       if (sceneDuration > scene.durationLimit) {
         result.push({
@@ -99,7 +150,7 @@ export function useStudio() {
           level: 'warning',
           sceneId: scene.id,
           title: `${scene.code} 超出场次限额`,
-          detail: `预计 ${sceneDuration.toFixed(1)} 秒，限额 ${scene.durationLimit} 秒，超出 ${(sceneDuration - scene.durationLimit).toFixed(1)} 秒。`
+          detail: `时间表跨度 ${sceneDuration.toFixed(1)} 秒，限额 ${scene.durationLimit} 秒，超出 ${(sceneDuration - scene.durationLimit).toFixed(1)} 秒。`
         })
       }
     }
@@ -175,8 +226,28 @@ export function useStudio() {
         if (!cue) continue
         if (field === 'rate') cue.rate = Number(value) as Cue['rate']
         else if (field === 'manualDuration') cue.manualDuration = value === '' || value === undefined ? undefined : Number(value)
+        else if (field === 'lockedStart') cue.lockedStart = value === '' || value === undefined ? undefined : round1(Number(value))
         else if (field === 'kind') cue.kind = value as CueKind
         else cue[field] = (value ?? '') as never
+        break
+      }
+    })
+  }
+
+  /** 锁定起点：未指定时钉住当前时间表算出的（本场相对）起点；再次调用解除。 */
+  function toggleCueLock(cueId: string) {
+    const current = cuePlacement(cueId)
+    const sceneId = state.value.document.scenes.find((scene) => scene.cues.some((cue) => cue.id === cueId))?.id
+    const schedule = sceneId ? timetable.value.scenes.find((item) => item.sceneId === sceneId) : undefined
+    const relativeStart = current && schedule ? round1(current.start - schedule.start) : 0
+    const target = state.value.document.scenes
+      .flatMap((scene) => scene.cues)
+      .find((cue) => cue.id === cueId)
+    commit(target?.lockedStart === undefined ? '锁定提示起点' : '解除起点锁定', (document) => {
+      for (const scene of document.scenes) {
+        const cue = scene.cues.find((item) => item.id === cueId)
+        if (!cue) continue
+        cue.lockedStart = cue.lockedStart === undefined ? relativeStart : undefined
         break
       }
     })
@@ -223,7 +294,8 @@ export function useStudio() {
         rate: 1,
         soundEffectId: kind === 'sfx' ? document.soundEffects[0]?.id : undefined,
         transition: kind === 'transition' ? '淡出' : '',
-        manualDuration: kind === 'transition' ? 3 : undefined
+        manualDuration: kind === 'transition' ? 3 : undefined,
+        lockedStart: undefined
       })
     })
     selectedCueId.value = id
@@ -235,6 +307,7 @@ export function useStudio() {
     })
   }
 
+  /** 拖动改序：受影响项（落点之后）随下一次时间表计算自动重排，锁定项保持不动。 */
   function moveCue(sceneId: string, cueId: string, targetCueId: string) {
     if (cueId === targetCueId) return
     commit('拖动调整台词与音效顺序', (document) => {
@@ -266,12 +339,12 @@ export function useStudio() {
   }
 
   function rejectChange(changeId: string) {
-    const index = state.value.pending.findIndex((item) => item.id === changeId && item.status === 'pending')
-    if (index < 0) return
-    const change = state.value.pending[index]
+    const targetIndex = state.value.pending.findIndex((item) => item.id === changeId && item.status === 'pending')
+    if (targetIndex < 0) return
+    const change = state.value.pending[targetIndex]
     undoStack.value.push(clone(state.value.document))
     state.value.document = clone(change.before)
-    for (let i = 0; i <= index; i += 1) {
+    for (let i = 0; i <= targetIndex; i += 1) {
       if (state.value.pending[i].status === 'pending') state.value.pending[i].status = 'rejected'
     }
     persist()
@@ -304,48 +377,82 @@ export function useStudio() {
       name: name.trim() || `制作稿 v${state.value.frozen.length + 1}`,
       createdAt: new Date().toISOString(),
       document: clone(state.value.document),
-      totalDuration: totalDuration.value
+      totalDuration: totalDuration.value,
+      timetable: clone(timetable.value)
     }
     state.value.frozen.unshift(version)
     persist()
     return version
   }
 
-  function makeScript(document: StudioDocument): string {
+  /** 带轨道时间的制作稿文本。旧冻结稿没有时间表时按当前顺序兼容补齐。 */
+  function makeScript(document: StudioDocument, frozenTimetable?: Timetable): string {
+    const table = frozenTimetable ?? buildTimetable(document)
     const lines = [
       document.title,
       document.subtitle,
-      `目标时长：${document.targetDuration} 秒`,
+      `目标时长：${document.targetDuration} 秒｜时间表总时长：${table.totalDuration.toFixed(1)} 秒`,
+      `冲突：${table.conflicts.length} 项｜被拒绝音效：${table.scenes.reduce((total, scene) => total + scene.rejected.length, 0)} 条`,
       '='.repeat(48),
       ''
     ]
+
     document.scenes.forEach((scene, sceneIndex) => {
+      const schedule = table.scenes.find((item) => item.sceneId === scene.id)
+      const base = schedule?.start ?? 0
+      const placed = schedule?.placements ?? []
+      const mainItems = placed.filter((item) => item.track === 'main')
+      const sfxByTrack = new Map(SFX_TRACKS.map((track) => [track, placed.filter((item) => item.track === track)]))
+
       lines.push(`${scene.code}｜${scene.title}`)
       lines.push(`场景：${scene.location} / ${scene.timeOfDay}`)
       lines.push(`转场：${scene.transition}`)
-      lines.push(`场次限额：${scene.durationLimit} 秒｜预计：${durationOfScene(scene)} 秒`)
+      lines.push(`入场时间：${formatClock(base)}｜场次跨度：${(schedule?.span ?? 0).toFixed(1)} 秒｜限额：${scene.durationLimit} 秒`)
       lines.push('-'.repeat(34))
-      scene.cues.forEach((cue, cueIndex) => {
-        const prefix = `${String(cueIndex + 1).padStart(2, '0')} [${durationOfCue(cue).toFixed(1)}s]`
+
+      for (const placement of mainItems) {
+        const cue = scene.cues.find((item) => item.id === placement.cueId)
+        if (!cue) continue
+        const prefix = `[${formatClock(placement.start)} → ${formatClock(placement.end)}]${placement.locked ? ' 🔒' : ''}`
         if (cue.kind === 'dialogue') {
           const role = document.characters.find((character) => character.id === cue.characterId)?.name ?? '未指定角色'
-          lines.push(`${prefix} ${role}｜${cue.emotion || '自然'}｜语速 ${cue.rate}`)
+          lines.push(`${prefix} 主轨 ${role}｜${cue.emotion || '自然'}｜语速 ${cue.rate}`)
           lines.push(`    ${cue.text}`)
-        } else if (cue.kind === 'sfx') {
-          const effect = document.soundEffects.find((item) => item.id === cue.soundEffectId)
-          lines.push(`${prefix} 音效｜${cue.text}`)
-          lines.push(`    文件：${effect?.source ?? '缺失引用'}｜${effect?.note ?? '需补齐音效'}`)
         } else {
-          lines.push(`${prefix} 转场｜${cue.transition}｜${cue.text}`)
+          lines.push(`${prefix} 主轨 转场｜${cue.transition}｜${cue.text}`)
         }
-      })
+      }
+
+      for (const track of SFX_TRACKS) {
+        for (const placement of sfxByTrack.get(track) ?? []) {
+          const cue = scene.cues.find((item) => item.id === placement.cueId)
+          if (!cue) continue
+          const effect = document.soundEffects.find((item) => item.id === cue.soundEffectId)
+          const prefix = `[${formatClock(placement.start)} → ${formatClock(placement.end)}]${placement.locked ? ' 🔒' : ''}`
+          lines.push(`${prefix} ${TRACK_LABELS[track]} ${cue.text}`)
+          lines.push(`    文件：${effect?.source ?? '缺失引用'}｜${effect?.note ?? '需补齐音效'}`)
+        }
+      }
+
+      for (const placement of schedule?.rejected ?? []) {
+        const cue = scene.cues.find((item) => item.id === placement.cueId)
+        lines.push(`[拒绝 @${formatClock(placement.start)}] 音效通道容量不足：${cue?.text ?? placement.cueId}（请求 ${placement.duration.toFixed(1)}s，三条通道均占用）`)
+      }
+
+      if (schedule?.conflicts.length) {
+        lines.push('—— 排程冲突 ——')
+        for (const conflict of schedule.conflicts) {
+          lines.push(`✗ ${conflict.title}：${conflict.detail}`)
+        }
+      }
+
       if (sceneIndex < document.scenes.length - 1) lines.push('')
     })
     return lines.join('\n')
   }
 
   function downloadVersion(version: FrozenVersion) {
-    const blob = new Blob([makeScript(version.document)], { type: 'text/plain;charset=utf-8' })
+    const blob = new Blob([makeScript(version.document, version.timetable)], { type: 'text/plain;charset=utf-8' })
     const url = URL.createObjectURL(blob)
     const anchor = document.createElement('a')
     anchor.href = url
@@ -369,15 +476,19 @@ export function useStudio() {
     selectedSceneId,
     selectedCueId,
     selectedScene,
+    timetable,
     totalDuration,
     pendingChanges,
     warnings,
     saveState,
     durationOfCue,
     durationOfScene,
+    cuePlacement,
+    sceneSchedule,
     updateProject,
     updateScene,
     updateCue,
+    toggleCueLock,
     addScene,
     deleteScene,
     addCue,
