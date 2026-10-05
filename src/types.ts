@@ -26,6 +26,8 @@ export interface Cue {
   soundEffectId?: string
   transition: string
   manualDuration?: number
+  /** 相对本场起点的锁定开始时间（秒）；未设置时按顺序自动排入。 */
+  lockedStart?: number | null
 }
 
 export interface Scene {
@@ -46,6 +48,58 @@ export interface StudioDocument {
   characters: Character[]
   soundEffects: SoundEffect[]
   scenes: Scene[]
+  /** 每场音效通道数量，旧稿未设置时按 3 条补齐。 */
+  sfxChannels?: number
+  /** 结构版本号：旧稿（v1 纯时长排列）按顺序兼容补齐轨道时间。 */
+  scheduleVersion?: number
+}
+
+export type TimelineTrack = 'main' | 'sfx'
+export type ScheduleStatus = 'scheduled' | 'rejected'
+export type ScheduleConflictType = 'actor-overlap' | 'track-overflow' | 'channel-full'
+
+export interface ScheduledItem {
+  cueId: string
+  sceneId: string
+  kind: CueKind
+  track: TimelineTrack
+  /** 音效通道序号（0 起），仅音效项有值。 */
+  channel?: number
+  /** 相对本场起点的开始时间（秒）。 */
+  start: number
+  end: number
+  duration: number
+  status: ScheduleStatus
+  locked: boolean
+  characterId?: string
+  actor?: string
+  /** 被拒绝或发生冲突的原因。 */
+  reason?: ScheduleConflictType
+}
+
+export interface ScheduleConflict {
+  type: ScheduleConflictType
+  sceneId: string
+  cueId?: string
+  cueIds?: string[]
+  detail: string
+}
+
+export interface SceneSchedule {
+  sceneId: string
+  items: ScheduledItem[]
+  conflicts: ScheduleConflict[]
+  /** 本场相对全剧的起点偏移（秒）。 */
+  offset: number
+  duration: number
+}
+
+export interface TimelineSchedule {
+  scenes: SceneSchedule[]
+  conflicts: ScheduleConflict[]
+  totalDuration: number
+  sfxChannels: number
+  rejectedCount: number
 }
 
 export interface PendingChange {
@@ -64,6 +118,8 @@ export interface FrozenVersion {
   createdAt: string
   document: StudioDocument
   totalDuration: number
+  /** 冻结时的轨道时间表快照。 */
+  schedule?: TimelineSchedule
 }
 
 export interface StudioState {
@@ -73,9 +129,17 @@ export interface StudioState {
   updatedAt: string
 }
 
+export type WarningType =
+  | 'collision'
+  | 'missing-sfx'
+  | 'over-time'
+  | 'actor-overlap'
+  | 'track-overflow'
+  | 'channel-full'
+
 export interface WarningItem {
   id: string
-  type: 'collision' | 'missing-sfx' | 'over-time'
+  type: WarningType
   level: 'error' | 'warning'
   sceneId: string
   cueId?: string

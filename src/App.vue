@@ -17,13 +17,17 @@ import {
   NTag
 } from 'naive-ui'
 import { useStudio } from './useStudio'
-import type { Cue, CueKind, Rate } from './types'
+import { fmtTime } from './timeline'
+import type { Cue, CueKind, Rate, ScheduledItem, SceneSchedule } from './types'
 
 const studio = useStudio()
 const {
   state,
   selectedSceneId,
+  selectedCueId,
   selectedScene,
+  schedule,
+  itemByCue,
   totalDuration,
   pendingChanges,
   warnings,
@@ -39,6 +43,8 @@ const {
   deleteCue,
   moveCue,
   moveScene,
+  lockCueStart,
+  unlockCueStart,
   acceptChange,
   rejectChange,
   acceptAll,
@@ -53,6 +59,102 @@ const dragCueId = ref('')
 const showFreezeModal = ref(false)
 const freezeName = ref('')
 const activeRightTab = ref('warnings')
+
+const selectedSceneSchedule = computed<SceneSchedule | undefined>(() =>
+  schedule.value.scenes.find((scene) => scene.sceneId === selectedSceneId.value)
+)
+const conflictCount = computed(() => schedule.value.conflicts.length)
+const rejectedCount = computed(() => schedule.value.rejectedCount)
+
+const PX_PER_SECOND = 4
+
+const sceneTrackWidth = computed(() => Math.max(320, Math.ceil((selectedSceneSchedule.value?.duration ?? 0) * PX_PER_SECOND) + 40))
+
+const rulerTicks = computed(() => {
+  const duration = selectedSceneSchedule.value?.duration ?? 0
+  const step = duration > 120 ? 15 : duration > 60 ? 10 : 5
+  const ticks: Array<{ left: number; label: string }> = []
+  for (let t = 0; t <= duration + 0.01; t += step) {
+    ticks.push({ left: t * PX_PER_SECOND, label: fmtTime(t) })
+  }
+  return ticks
+})
+
+const mainTrackItems = computed(() =>
+  (selectedSceneSchedule.value?.items ?? []).filter((item) => item.track === 'main')
+)
+
+const channelItems = computed(() => {
+  const channels = schedule.value.sfxChannels
+  return Array.from({ length: channels }, (_, channel) =>
+    (selectedSceneSchedule.value?.items ?? []).filter(
+      (item) => item.track === 'sfx' && item.channel === channel
+    )
+  )
+})
+
+const rejectedItems = computed(() =>
+  (selectedSceneSchedule.value?.items ?? []).filter((item) => item.status === 'rejected')
+)
+
+const sceneConflicts = computed(() => selectedSceneSchedule.value?.conflicts ?? [])
+
+function itemStyle(item: ScheduledItem) {
+  return {
+    left: `${item.start * PX_PER_SECOND}px`,
+    width: `${Math.max(26, item.duration * PX_PER_SECOND)}px`
+  }
+}
+
+function itemClass(item: ScheduledItem) {
+  return {
+    'block-dialogue': item.kind === 'dialogue',
+    'block-transition': item.kind === 'transition',
+    'block-sfx': item.kind === 'sfx',
+    'is-locked': item.locked,
+    'is-rejected': item.status === 'rejected',
+    'is-selected': selectedCueId.value === item.cueId,
+    'is-conflict': item.reason !== undefined && item.status === 'scheduled'
+  }
+}
+
+function itemTitle(item: ScheduledItem) {
+  const cue = selectedScene.value?.cues.find((entry) => entry.id === item.cueId)
+  const status = item.status === 'rejected'
+    ? '｜已拒绝：通道满载'
+    : item.reason
+      ? `｜冲突：${item.reason}`
+      : ''
+  return `${cue?.text ?? ''}（${fmtTime(item.start)}→${fmtTime(item.end)}${item.locked ? ' · 锁定' : ''}）${status}`
+}
+
+function blockLabel(item: ScheduledItem) {
+  if (item.kind === 'sfx') {
+    return state.value.document.soundEffects.find((effect) => effect.id === cueById(item.cueId)?.soundEffectId)?.name ?? '音效'
+  }
+  if (item.kind === 'transition') return cueById(item.cueId)?.transition || '转场'
+  return cueName(cueById(item.cueId) as Cue)
+}
+
+function cueById(cueId: string): Cue | undefined {
+  return selectedScene.value?.cues.find((cue) => cue.id === cueId)
+}
+
+function selectCue(cueId: string) {
+  selectedCueId.value = cueId
+}
+
+function warningTag(type: string) {
+  switch (type) {
+    case 'collision': return '撞场'
+    case 'missing-sfx': return '引用'
+    case 'over-time': return '时长'
+    case 'actor-overlap': return '演员重叠'
+    case 'track-overflow': return '主轨冲突'
+    case 'channel-full': return '通道满载'
+    default: return type
+  }
+}
 
 const kindOptions = [
   { label: '台词', value: 'dialogue' },
@@ -289,12 +391,13 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
               v-for="(cue, index) in selectedScene.cues"
               :key="cue.id"
               class="cue-card"
-              :class="[`kind-${cue.kind}`, { dragging: dragCueId === cue.id }]"
+              :class="[`kind-${cue.kind}`, { dragging: dragCueId === cue.id, 'card-rejected': itemByCue.get(cue.id)?.status === 'rejected', 'card-locked': itemByCue.get(cue.id)?.locked, selected: selectedCueId === cue.id }]"
               draggable="true"
               @dragstart="dragCueId = cue.id"
               @dragend="dragCueId = ''"
               @dragover.prevent
               @drop="dropCue(cue.id)"
+              @click="selectCue(cue.id)"
             >
               <div class="cue-grip" title="拖动调整顺序">⋮⋮</div>
               <div class="cue-main">
@@ -303,7 +406,19 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
                   <n-select class="kind-select" size="small" :value="cue.kind" :options="kindOptions" @update:value="changeCueKind(cue, $event)" />
                   <n-tag size="small" :bordered="false">{{ cueName(cue) }}</n-tag>
                   <span class="duration-pill">{{ durationOfCue(cue).toFixed(1) }}s</span>
-                  <n-button size="tiny" tertiary type="error" @click="deleteCue(cue.id)">删除</n-button>
+                  <span
+                    v-if="itemByCue.get(cue.id)?.status === 'scheduled'"
+                    class="schedule-time"
+                  >{{ fmtTime(itemByCue.get(cue.id)!.start) }} → {{ fmtTime(itemByCue.get(cue.id)!.end) }}<template v-if="itemByCue.get(cue.id)?.channel !== undefined"> · 通道 {{ String.fromCharCode(65 + itemByCue.get(cue.id)!.channel!) }}</template></span>
+                  <n-tag v-if="itemByCue.get(cue.id)?.status === 'rejected'" size="small" type="error" :bordered="false">通道满载·已拒绝</n-tag>
+                  <n-button
+                    size="tiny"
+                    tertiary
+                    :type="itemByCue.get(cue.id)?.locked ? 'warning' : 'default'"
+                    :disabled="itemByCue.get(cue.id)?.status === 'rejected'"
+                    @click.stop="itemByCue.get(cue.id)?.locked ? unlockCueStart(cue.id) : lockCueStart(cue.id)"
+                  >{{ itemByCue.get(cue.id)?.locked ? `解锁 @${fmtTime(itemByCue.get(cue.id)!.start)}` : '锁定起点' }}</n-button>
+                  <n-button size="tiny" tertiary type="error" @click.stop="deleteCue(cue.id)">删除</n-button>
                 </div>
 
                 <div v-if="cue.kind === 'dialogue'" class="cue-grid">
@@ -337,6 +452,104 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
               <template #extra><n-button @click="addCue('dialogue')">添加第一条台词</n-button></template>
             </n-empty>
           </div>
+
+          <div class="timeline-board" v-if="selectedSceneSchedule">
+            <div class="timeline-board-head">
+              <div>
+                <span class="eyebrow">TRACK SHEET · {{ selectedScene.code }}</span>
+                <h3>轨道时间表</h3>
+              </div>
+              <div class="timeline-legend">
+                <span class="legend-item"><i class="dot dot-main"></i>主轨 · 台词</span>
+                <span class="legend-item"><i class="dot dot-transition"></i>主轨 · 转场（接前一项末尾）</span>
+                <span class="legend-item"><i class="dot dot-sfx"></i>音效通道 A/B/C（每场 {{ schedule.sfxChannels }} 条）</span>
+                <span class="legend-item"><i class="dot dot-lock"></i>起点已锁定</span>
+              </div>
+            </div>
+
+            <div class="timeline-summary" v-if="sceneConflicts.length || rejectedItems.length">
+              <n-tag size="small" type="error" :bordered="false">本场冲突 {{ sceneConflicts.length }}</n-tag>
+              <n-tag size="small" type="error" :bordered="false">拒绝提示 {{ rejectedItems.length }}</n-tag>
+              <span>音效通道满载会按场次拒绝并标出；拖动、改语速、换音效均从受影响项向后重排。</span>
+            </div>
+
+            <div class="timeline-scroll">
+              <div class="timeline-canvas" :style="{ width: `${sceneTrackWidth}px` }">
+                <div class="ruler" :style="{ width: `${sceneTrackWidth}px` }">
+                  <span
+                    v-for="tick in rulerTicks"
+                    :key="tick.label"
+                    class="ruler-tick"
+                    :style="{ left: `${tick.left}px` }"
+                  >{{ tick.label }}</span>
+                </div>
+
+                <div class="lane lane-main">
+                  <div class="lane-label">主轨</div>
+                  <div class="lane-track">
+                    <div
+                      v-for="item in mainTrackItems"
+                      :key="item.cueId"
+                      class="track-block"
+                      :class="itemClass(item)"
+                      :style="itemStyle(item)"
+                      :title="itemTitle(item)"
+                      @click="selectCue(item.cueId)"
+                    >
+                      <span class="block-name">{{ blockLabel(item) }}</span>
+                      <span class="block-time">{{ fmtTime(item.start) }}–{{ fmtTime(item.end) }}</span>
+                      <span v-if="item.locked" class="block-lock">🔒</span>
+                    </div>
+                  </div>
+                </div>
+
+                <div v-for="(lane, channel) in channelItems" :key="channel" class="lane lane-sfx">
+                  <div class="lane-label">音效 {{ String.fromCharCode(65 + channel) }}</div>
+                  <div class="lane-track">
+                    <div
+                      v-for="item in lane"
+                      :key="item.cueId"
+                      class="track-block"
+                      :class="itemClass(item)"
+                      :style="itemStyle(item)"
+                      :title="itemTitle(item)"
+                      @click="selectCue(item.cueId)"
+                    >
+                      <span class="block-name">{{ blockLabel(item) }}</span>
+                      <span class="block-time">{{ fmtTime(item.start) }}–{{ fmtTime(item.end) }}</span>
+                      <span v-if="item.locked" class="block-lock">🔒</span>
+                    </div>
+                  </div>
+                </div>
+
+                <div v-if="rejectedItems.length" class="lane lane-rejected">
+                  <div class="lane-label">拒绝</div>
+                  <div class="lane-track">
+                    <div
+                      v-for="item in rejectedItems"
+                      :key="item.cueId"
+                      class="track-block rejected-block"
+                      :style="{ left: `${item.start * PX_PER_SECOND}px`, width: `${Math.max(26, item.duration * PX_PER_SECOND)}px` }"
+                      :title="itemTitle(item)"
+                      @click="selectCue(item.cueId)"
+                    >
+                      <span class="block-name">{{ blockLabel(item) }}</span>
+                      <span class="block-time">拒绝 @{{ fmtTime(item.start) }}</span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <ul class="conflict-list" v-if="sceneConflicts.length">
+              <li v-for="(conflict, conflictIndex) in sceneConflicts" :key="conflictIndex" class="conflict-line">
+                <n-tag size="tiny" type="error" :bordered="false">
+                  {{ conflict.type === 'channel-full' ? '通道满载' : conflict.type === 'actor-overlap' ? '演员重叠' : '主轨溢出' }}
+                </n-tag>
+                <span>{{ conflict.detail }}</span>
+              </li>
+            </ul>
+          </div>
         </section>
 
         <aside class="review-column">
@@ -352,7 +565,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
               <div class="review-list">
                 <div v-for="warning in warnings" :key="warning.id" class="warning-card" :class="warning.level">
                   <div class="warning-title">
-                    <n-tag size="small" :type="warning.level === 'error' ? 'error' : 'warning'" :bordered="false">{{ warning.type === 'collision' ? '撞场' : warning.type === 'missing-sfx' ? '引用' : '时长' }}</n-tag>
+                    <n-tag size="small" :type="warning.level === 'error' ? 'error' : 'warning'" :bordered="false">{{ warningTag(warning.type) }}</n-tag>
                     <strong>{{ warning.title }}</strong>
                   </div>
                   <p>{{ warning.detail }}</p>
@@ -388,11 +601,16 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
                   <div>
                     <strong>{{ version.name }}</strong>
                     <span>{{ new Date(version.createdAt).toLocaleString('zh-CN') }}</span>
-                    <small>{{ version.document.scenes.length }} 场 · {{ version.totalDuration.toFixed(1) }} 秒</small>
+                    <small>
+                      {{ version.document.scenes.length }} 场 · {{ version.totalDuration.toFixed(1) }} 秒 · 每场 {{ version.schedule?.sfxChannels ?? 3 }} 条音效通道
+                      <template v-if="version.schedule && (version.schedule.conflicts.length || version.schedule.rejectedCount)">
+                        · 冲突 {{ version.schedule.conflicts.length }} · 拒绝 {{ version.schedule.rejectedCount }}
+                      </template>
+                    </small>
                   </div>
                   <n-button size="small" type="primary" secondary @click="downloadVersion(version)">导出稿</n-button>
                 </div>
-                <n-empty v-if="!state.frozen.length" description="冻结后生成只读制作稿" />
+                <n-empty v-if="!state.frozen.length" description="冻结后生成只读制作稿（含轨道起止时间）" />
               </div>
             </n-tab-pane>
           </n-tabs>
@@ -404,7 +622,10 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
       <div class="dialog-card">
         <span class="eyebrow">FREEZE VERSION</span>
         <h2>冻结当前版本</h2>
-        <p>冻结会保存一份不可变快照，并立即下载纯文本制作稿。当前草稿仍可继续编辑。</p>
+        <p>冻结会保存一份不可变快照（含主轨与音效通道的起止时间、锁定起点），并立即下载纯文本制作稿。当前草稿仍可继续编辑。</p>
+        <n-alert v-if="conflictCount || rejectedCount" type="warning" :show-icon="false" style="margin-bottom: 12px">
+          当前时间表有 {{ conflictCount }} 项冲突、{{ rejectedCount }} 条被拒绝提示，导出稿会原样标注，请先确认。
+        </n-alert>
         <n-input v-model:value="freezeName" placeholder="版本名称" @keyup.enter="confirmFreeze" />
         <div class="dialog-actions">
           <n-button @click="showFreezeModal = false">取消</n-button>
